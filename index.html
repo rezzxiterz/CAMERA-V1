@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>CAMERA REAL LIFE</title>
+  <style>
+    body { background:#0b0b0b; color:#eee; font-family:Inter, Arial, Helvetica, sans-serif; display:flex; flex-direction:column; align-items:center; gap:12px; padding:12px; }
+    #container{ position:relative; width: 820px; max-width:96vw; background:#111; padding:8px; border-radius:8px; box-shadow:0 6px 18px rgba(0,0,0,0.6);}
+    video { display:block; width:100%; height:auto; border-radius:6px; transform:scaleX(1); }
+    canvas{ position:absolute; left:8px; top:8px; pointer-events:none; }
+    .controls{ display:flex; gap:8px; justify-content:center; margin-top:8px; flex-wrap:wrap;}
+    button{ background:#2db76b; border:none; padding:8px 12px; border-radius:6px; cursor:pointer; font-weight:700; color:#012; }
+    button.secondary{ background:#5a9c5f; color:#012; }
+    #status{ font-size:13px; color:#bde; text-align:center; margin-top:6px;}
+    #badge{ position:absolute; right:14px; top:12px; background:rgba(0,0,0,0.6); color:#fff; padding:6px 10px; border-radius:999px; font-weight:700; }
+    .note{ font-size:12px; color:#9cc; text-align:center; max-width:820px; }
+  </style>
+</head>
+<body>
+  <h2>REZZ AXTH</h2>
+
+  <div id="container">
+    <div style="position:relative;">
+      <video id="video" autoplay muted playsinline></video>
+      <canvas id="overlay"></canvas>
+      <div id="badge">USER : 0</div>
+    </div>
+
+    <div class="controls">
+      <button id="startBtn">START KAMERA</button>
+      <button id="stopBtn" class="secondary">STOP KAMERA</button>
+      <button id="switchBtn">GANTI KAMERA</button>
+      <button id="snapBtn" class="secondary">AMBIL FOTO</button>
+      <button id="reloadModels" class="secondary">MUAT ULANG</button>
+    </div>
+
+    <div id="status">LOADINGG</div>
+    <div class="note">
+      WEBSITE INI DI BUAT SAMA REZZ XITERZ
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/face-api.js@0.22.2/dist/face-api.min.js"></script>
+  <script>
+  const MODEL_URL = 'https://justadudewhohacks.github.io/face-api.js/models/';
+
+  const video = document.getElementById('video');
+  const overlay = document.getElementById('overlay');
+  const ctx = overlay.getContext('2d');
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const switchBtn = document.getElementById('switchBtn');
+  const snapBtn = document.getElementById('snapBtn');
+  const reloadModelsBtn = document.getElementById('reloadModels');
+  const statusEl = document.getElementById('status');
+  const badge = document.getElementById('badge');
+
+  let currentStream = null;
+  let facingMode = 'USER'; // 'USER' depan, 'environment' belakang
+  let rafId = null;
+  let modelsLoaded = false;
+
+  // Smoothing parameters
+  const SMOOTH_ALPHA = 0.6; // closer to 1 = smoother but more lag
+  let prevBoxes = []; // array of {x,y,w,h,centerX,centerY}
+
+  // DISTANCE ESTIMATION - konfigurasi default
+  // KNOWN_FACE_HEIGHT_M = tinggi wajah dari dagu ke atas rambut (kira-kira) -> 0.25 m (25 cm)
+  // FOCAL_LENGTH_PIX default dipilih agar keluaran masuk akal untuk webcam biasa.
+  // Untuk akurasi, kalibrasi: berdiri di jarak D meter lalu catat pixelHeight P, lalu set focal = P * D / KNOWN_FACE_HEIGHT_M
+  const KNOWN_FACE_HEIGHT_M = 0.25; // 25 cm (ubah jika ingin)
+  let FOCAL_LENGTH_PIX = 700; // default, bisa dikalibrasi
+
+  async function loadModels() {
+    statusEl.innerText = 'STATUS : PROSES....';
+    try {
+      await Promise.all([
+        faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+        faceapi.nets.faceExpressionNet.loadFromUri(MODEL_URL),
+        faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL)
+      ]);
+      modelsLoaded = true;
+      statusEl.innerText = 'STATUS : PREMIUM';
+    } catch (err) {
+      console.error(err);
+      statusEl.innerText = 'STATUS : GAGAL PROSES/CORS.';
+    }
+  }
+
+  async function startCamera() {
+    stopCamera();
+    const constraints = { audio:false, video: { facingMode: { exact: facingMode } } };
+    try {
+      currentStream = await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (err) {
+      try { currentStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode }, audio:false }); }
+      catch (err2) { currentStream = await navigator.mediaDevices.getUserMedia({ video:true, audio:false }); }
+    }
+    video.srcObject = currentStream;
+    video.onloadedmetadata = () => {
+      video.play();
+      resizeCanvas();
+      statusEl.innerText = `STATUS : ONLINE (${facingMode})`;
+      startLoop();
+    };
+  }
+
+  function stopCamera() {
+    if (currentStream) {
+      currentStream.getTracks().forEach(t=>t.stop());
+      currentStream = null;
+    }
+    stopLoop();
+    ctx.clearRect(0,0,overlay.width, overlay.height);
+    badge.innerText = 'USER : 0';
+    prevBoxes = [];
+    statusEl.innerText = 'STATUS : OFFLINE';
+  }
+
+  function switchCamera() {
+    facingMode = (facingMode === 'USER') ? 'environment' : 'USER';
+    statusEl.innerText = `Status: mengganti kamera -> ${facingMode} ...`;
+    startCamera();
+  }
+
+  function resizeCanvas() {
+    overlay.width = video.videoWidth || 640;
+    overlay.height = video.videoHeight || 480;
+    overlay.style.width = video.clientWidth + 'px';
+    overlay.style.height = video.clientHeight + 'px';
+  }
+
+  // smoothing: cocokkan detections ke prevBoxes berdasar center jarak
+  function matchAndSmooth(detections) {
+    const newBoxes = detections.map(d => {
+      const b = d.detection.box;
+      // expand box supaya rambut/atas kepala kebagian (expandY atas lebih besar)
+      const expandX = b.width * 0.12;
+      const expandYTop = b.height * 0.30; // lebih besar ke atas untuk rambut
+      const expandYBottom = b.height * 0.08;
+      const x = Math.max(0, b.x - expandX);
+      const y = Math.max(0, b.y - expandYTop);
+      const w = Math.min(overlay.width - x, b.width + expandX*2);
+      const h = Math.min(overlay.height - y, b.height + expandYTop + expandYBottom);
+      const cx = x + w/2, cy = y + h/2;
+      return { x, y, w, h, cx, cy, rawDet: d };
+    });
+
+    // matching
+    const matched = [];
+    const usedPrev = new Set();
+    newBoxes.forEach(nb => {
+      let bestIdx = -1, bestDist = Infinity;
+      for (let i=0;i<prevBoxes.length;i++) {
+        if (usedPrev.has(i)) continue;
+        const pb = prevBoxes[i];
+        const dx = pb.cx - nb.cx, dy = pb.cy - nb.cy;
+        const dist = Math.hypot(dx,dy);
+        if (dist < bestDist) { bestDist = dist; bestIdx = i; }
+      }
+      if (bestIdx >= 0 && bestDist < Math.max(nb.w, nb.h) * 0.8) {
+        // smooth with prevBoxes[bestIdx]
+        const pb = prevBoxes[bestIdx];
+        const s = SMOOTH_ALPHA;
+        const sx = pb.x * s + nb.x * (1-s);
+        const sy = pb.y * s + nb.y * (1-s);
+        const sw = pb.w * s + nb.w * (1-s);
+        const sh = pb.h * s + nb.h * (1-s);
+        const scx = sx + sw/2, scy = sy + sh/2;
+        matched.push({ x:sx, y:sy, w:sw, h:sh, cx:scx, cy:scy, rawDet: nb.rawDet });
+        usedPrev.add(bestIdx);
+      } else {
+        // no match -> use new directly (but still soften slightly)
+        const s = 0.75;
+        matched.push({ x: nb.x*(1-s) + nb.x*s, y: nb.y*(1-s)+nb.y*s, w:nb.w, h:nb.h, cx:nb.cx, cy:nb.cy, rawDet: nb.rawDet });
+      }
+    });
+
+    // update prevBoxes = matched (if fewer prevBoxes maybe keep some)
+    prevBoxes = matched;
+    return matched;
+  }
+
+  // estimation fungsi: tinggi r dgn focal length
+  function estimateDistanceMeters(pixelHeight) {
+    // Hindari divide by zero
+    if (pixelHeight <= 0) return null;
+    const dist = (KNOWN_FACE_HEIGHT_M * FOCAL_LENGTH_PIX) / pixelHeight;
+    return dist; // in meters
+  }
+
+  function formatDistance(distMeters) {
+    if (distMeters === null) return '?';
+    if (distMeters >= 1) return `${distMeters.toFixed(2)}M`;
+    return `${Math.round(distMeters*100)}CM`;
+  }
+
+  // gambar kotak + label
+  function drawAll(boxes) {
+    ctx.clearRect(0,0,overlay.width, overlay.height);
+    const fontSize = Math.max(12, Math.round(overlay.width / 60));
+    ctx.font = `${fontSize}px Inter, Arial`;
+    ctx.textBaseline = 'top';
+
+    const count = boxes.length;
+    badge.innerText = `USER : ${count}`;
+
+    boxes.forEach((b, idx) => {
+      const box = b;
+      const det = b.rawDet;
+      // choose top expression
+      const exprs = det.expressions || {};
+      let best = 'NEURAL', bs = 0;
+      Object.keys(exprs).forEach(k => { if (exprs[k] > bs) { bs = exprs[k]; best = k; } });
+      const percent = Math.round(bs * 100);
+
+      // color logic: green if only 1 person, red otherwise
+      const color = (count === 1) ? 'rgba(0,220,120,0.95)' : 'rgba(240,60,60,0.95)';
+      const textBgColor = color;
+      const textColor = '#021';
+
+      // draw box
+      ctx.lineWidth = Math.max(2, Math.round(overlay.width / 300));
+      ctx.strokeStyle = color;
+      ctx.fillStyle = color;
+      ctx.strokeRect(box.x, box.y, box.w, box.h);
+
+      // label: e.g. "REZZ XITERZ — VXZ (98%)"
+      const label = `REZZ XITERZ ${idx+1} — ${best} (${percent}%)`;
+
+      // draw label area above box
+      const pad = 6;
+      const textWidth = ctx.measureText(label).width;
+      const labelHeight = fontSize + 6;
+      let labelX = box.x;
+      let labelY = Math.max(0, box.y - labelHeight - 8);
+
+      ctx.fillStyle = textBgColor;
+      ctx.fillRect(labelX - 1, labelY - 1, textWidth + pad, labelHeight + 2);
+      ctx.fillStyle = textColor;
+      ctx.fillText(label, labelX + (pad/2), labelY + 3);
+
+      // distance estimation label (top center above head) e.g. "1 USER / 1.2M"
+      const distanceMeters = estimateDistanceMeters(box.h);
+      const distanceText = formatDistance(distanceMeters);
+      const headLabel = `${idx+1} USER / ${distanceText}`;
+
+      // draw headLabel centered above bounding label (or at top if space)
+      const headTextWidth = ctx.measureText(headLabel).width;
+      const headPad = 6;
+      let headX = box.x + (box.w - headTextWidth) / 2;
+      headX = Math.max(4, Math.min(headX, overlay.width - headTextWidth - 8));
+      let headY = labelY - (labelHeight + 6);
+      if (headY < 2) headY = labelY + labelHeight + 6; // kalau gak muat di atas, taruh di bawah label
+
+      // draw background rectangle (semi-transparent dark)
+      ctx.fillStyle = 'rgba(3,20,10,0.85)';
+      ctx.fillRect(headX - 1, headY - 1, headTextWidth + headPad, labelHeight + 2);
+      ctx.fillStyle = '#fff';
+      ctx.fillText(headLabel, headX + (headPad/2), headY + 3);
+    });
+  }
+
+  // main loop
+  async function processFrame() {
+    if (!modelsLoaded) return;
+    if (video.paused || video.ended) {
+      rafId = requestAnimationFrame(processFrame);
+      return;
+    }
+
+    // TODO: tune inputSize for perf/accuracy
+    const options = new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 });
+    try {
+      const results = await faceapi.detectAllFaces(video, options).withFaceLandmarks().withFaceExpressions();
+      const resized = faceapi.resizeResults(results, { width: overlay.width, height: overlay.height });
+      const smoothed = matchAndSmooth(resized);
+      drawAll(smoothed);
+    } catch (err) {
+      console.error('DETEKSI EROR', err);
+    }
+
+    rafId = requestAnimationFrame(processFrame);
+  }
+
+  function startLoop() {
+    if (rafId) return;
+    rafId = requestAnimationFrame(processFrame);
+  }
+  function stopLoop() {
+    if (rafId) {
+      cancelAnimationFrame(rafId);
+      rafId = null;
+    }
+  }
+
+  // snapshot
+  function takeSnapshot() {
+    if (!video || video.readyState < 2) return;
+    const snapCanvas = document.createElement('canvas');
+    snapCanvas.width = video.videoWidth;
+    snapCanvas.height = video.videoHeight;
+    const sctx = snapCanvas.getContext('2d');
+    sctx.drawImage(video, 0, 0, snapCanvas.width, snapCanvas.height);
+    sctx.drawImage(overlay, 0, 0, snapCanvas.width, snapCanvas.height);
+    const dataUrl = snapCanvas.toDataURL('image/png');
+    const w = window.open('');
+    w.document.write(`<img src="${dataUrl}" style="max-width:100%;">`);
+  }
+
+  // tombol events
+  startBtn.addEventListener('click', async () => {
+    if (!modelsLoaded) await loadModels();
+    await startCamera();
+  });
+  stopBtn.addEventListener('click', stopCamera);
+  switchBtn.addEventListener('click', switchCamera);
+  snapBtn.addEventListener('click', takeSnapshot);
+  reloadModelsBtn.addEventListener('click', async () => { await loadModels(); });
+
+  window.addEventListener('resize', () => { if (video.videoWidth) resizeCanvas(); });
+
+  // load models on start (optional)
+  loadModels();
+
+  // --------- CATATAN KALIBRASI ----------
+  // Untuk meningkatkan akurasi jarak:
+  // 1) Berdiri di jarak D (meter) yang kamu ketahui, misal 1.0 m.
+  // 2) Catat nilai pixelHeight P (tinggi bounding box) yang muncul.
+  // 3) Masukkan FOCAL_LENGTH_PIX = (P * D) / KNOWN_FACE_HEIGHT_M
+  // Contoh: jika P=300px di jarak 1.0m dan KNOWN_FACE_HEIGHT_M=0.25m, focal = 300*1 / 0.25 = 1200.
+  // Kamu bisa set nilai ini di console: FOCAL_LENGTH_PIX = 1200;
+  //
+  // Disclaimer: ini estimasi kasar. Hasil bervariasi tergantung kamera, zoom, dan posisi kepala.
+  // --------------------------------------
+
+  </script>
+</body>
+</html>
